@@ -1,0 +1,28 @@
+name: Daily Discord Signal Bot
+
+on:
+  schedule:
+    - cron: "5 20 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Discord Signal Bot
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.WEBHOOK_GTAA }}
+          # Optional: DEBUG=1 für Gate-Debug-Tabellen (10M-SMA, obs20, Reason)
+          DEBUG: ${{ vars.DEBUG }}
+        run: python bot.py
