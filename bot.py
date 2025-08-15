@@ -85,32 +85,42 @@ def realized_vol_ann_from_prices_per_column(
     return pd.DataFrame(out, index=prices.index)
 
 def sum_momentum_1_3_6_9m(rets_m: pd.DataFrame, as_of_eom: pd.Timestamp) -> pd.Series:
-    if as_of_eom not in rets_m.index:
-        as_of_eom = rets_m.index.dropna().max()
-    pos = rets_m.index.get_loc(as_of_eom)
-    if pos < 8:
-        take = [1, min(3, pos+1), min(6, pos+1), min(9, pos+1)]
-        sums = {}
-        for col in rets_m.columns:
-            s = rets_m[col].iloc[:pos+1].dropna()
-            parts = [
-                s.iloc[-take[0]:].sum() if len(s) >= take[0] else np.nan,
-                s.iloc[-take[1]:].sum() if len(s) >= take[1] else np.nan,
-                s.iloc[-take[2]:].sum() if len(s) >= take[2] else np.nan,
-                s.iloc[-take[3]:].sum() if len(s) >= take[3] else np.nan,
-            ]
-            sums[col] = np.nansum(parts)
-        return pd.Series(sums).sort_values(ascending=False)
-    sums = {}
-    for col in rets_m.columns:
-        s = rets_m[col]
-        sums[col] = np.nansum([
-            s.iloc[pos-0:pos+1].sum(),
-            s.iloc[pos-2:pos+1].sum(),
-            s.iloc[pos-5:pos+1].sum(),
-            s.iloc[pos-8:pos+1].sum(),
-        ])
-    return pd.Series(sums).sort_values(ascending=False)
+    """
+    KORREKT: ΣMomentum = Summe der *vier kumulierten* Renditen über 1/3/6/9 Monate,
+    jeweils als (Preis_asof / Preis_vor_m_Monaten - 1). Keine Überlappungs-Doppelzählung.
+
+    Hinweis: Wir arbeiten auf 'rets_m' Index (EOM). Für die Preisbasis nehmen wir
+    die zugehörigen EOM-Preise, die aus 'rets_m' rekonstruierbar sind: P_t = P_{t-1} * (1 + r_t).
+    Praktisch ist es robuster, wenn wir die Monats-Preise direkt übergeben; deshalb
+    rekonstruiere ich hier aus rets_m die Preisreihe relativ (Start=1.0).
+    """
+    # Reconstruiere relative Preisreihe (Start = 1.0)
+    # P_t = cumprod(1 + r_t)
+    prices_rel = (1.0 + rets_m).cumprod()
+
+    # Stelle sicher, dass 'as_of_eom' im Index vorhanden ist.
+    if as_of_eom not in prices_rel.index:
+        as_of_eom = prices_rel.index.max()
+
+    pos = prices_rel.index.get_loc(as_of_eom)
+
+    def cumret_over_months(series: pd.Series, m: int) -> float:
+        if pos - m < 0:
+            return np.nan
+        p_now = series.iloc[pos]
+        p_then = series.iloc[pos - m]
+        return (p_now / p_then) - 1.0
+
+    out = {}
+    for col in prices_rel.columns:
+        s = prices_rel[col].dropna()
+        # falls Daten zu kurz sind, wird np.nan verwendet
+        r1  = cumret_over_months(s, 1)
+        r3  = cumret_over_months(s, 3)
+        r6  = cumret_over_months(s, 6)
+        r9  = cumret_over_months(s, 9)
+        out[col] = np.nansum([r1, r3, r6, r9])
+    return pd.Series(out).sort_values(ascending=False)
 
 def compute_obs20(prices: pd.Series, d: pd.Timestamp, window: int = VOL_WINDOW) -> int:
     s = prices.dropna().loc[:d]
@@ -373,3 +383,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
