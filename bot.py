@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Signal Bot v3.3 (ohne Codeblock, Spalten-Unterstriche an Breite angepasst)
-- Sendet normalen Text (kein Rahmen), Tabellen mit sauberer Unterstreichung pro Spaltenbreite.
+Discord Signal Bot v3.2.1 – Ausgabe im Schema aus 'Ausgabe.txt'
+- Codeblock (Monospace) für perfekte Spaltenausrichtung.
+- Unterstreichungen jetzt exakt in Spaltenbreite (nicht nur Header-Länge).
 - ΣMomentum 1/3/6/9M ohne Überlappung.
 - Leverage-Gate nur Top-3 (EOM & Heute): Preis > 10M-SMA & 20d-Vol < 30%.
 """
@@ -12,7 +13,7 @@ from __future__ import annotations
 import os
 import requests
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Tuple, Optional
 
 import pandas as pd
 import numpy as np
@@ -27,7 +28,7 @@ VOL_WINDOW     = 20
 VOL_THR        = 0.30
 TOP_N          = 3
 
-DEBUG          = os.getenv("DEBUG", "0") == "1"        # beeinflusst Layout nicht
+DEBUG          = os.getenv("DEBUG", "0") == "1"        # Layout bleibt gleich
 ANNUALIZER_MODE = "uniform_252"
 MIXED_ANNUALIZER: Dict[str, int] = {"BTC-USD": 365}    # nur bei "mixed" aktiv
 
@@ -101,7 +102,7 @@ def compute_obs20(prices: pd.Series, d: pd.Timestamp, window: int = VOL_WINDOW) 
     r = s.pct_change(fill_method=None).dropna()
     return int(r.iloc[-window:].shape[0])
 
-def evaluate_gate(price: float, v20: float, s10m: float) -> tuple[bool, str]:
+def evaluate_gate(price: float, v20: float, s10m: float) -> Tuple[bool, str]:
     if any(pd.isna(x) for x in (price, v20, s10m)):
         return False, "NaN input"
     ok = (price > s10m) and (v20 < VOL_THR)
@@ -117,27 +118,34 @@ def fmt_price(v) -> str:
 def fmt_pct(v) -> str:
     return "NaN" if pd.isna(v) else f"{v*100:.2f}%"
 
+def fmt_pct_str(v) -> str:
+    return v if isinstance(v, str) else fmt_pct(v)
+
 def table_schema(headers: List[str], rows: List[List[str]]) -> str:
     """
-    Render mit linksbündigen Spalten.
-    Unterstrich-Länge = Spaltenbreite (max(Header, Zellen)).
+    Rendert Tabelle:
+      Header-Zeile
+      Unterstreichung: exakt in Spaltenbreite
+      Datenzeilen (links, mit 2 Spaces zwischen Spalten)
     """
-    # Spaltenbreiten bestimmen
+    # Spaltenbreiten anhand Header + Zellen
     widths = [len(h) for h in headers]
     for r in rows:
         for i, cell in enumerate(r):
-            w = len(str(cell)) if cell is not None else 0
-            widths[i] = max(widths[i], w)
+            widths[i] = max(widths[i], len("" if cell is None else str(cell)))
     # Header
-    head = "  ".join(str(headers[i]).ljust(widths[i]) for i in range(len(headers)))
-    # Unterstreichung in Spaltenbreite
+    head_line = "  ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
+    # Unterstreichungen in Spaltenbreite (FIX gegenüber v3.2)
     underline = "  ".join("-" * widths[i] for i in range(len(headers)))
     # Rows
-    body = "\n".join("  ".join((str(r[i]) if r[i] is not None else "").ljust(widths[i]) for i in range(len(headers))) for r in rows)
-    return "\n".join([head, underline, body]) if rows else "\n".join([head, underline])
+    body = "\n".join(
+        "  ".join(("" if r[i] is None else str(r[i])).ljust(widths[i]) for i in range(len(headers)))
+        for r in rows
+    )
+    return "\n".join([head_line, underline, body]) if rows else "\n".join([head_line, underline])
 
 def sep_line() -> str:
-    return "-" * 50
+    return "-" * 33
 
 # ================== Dataclasses ==================
 @dataclass
@@ -149,7 +157,7 @@ class GateRow:
     gate: str
 
 # ================== Strategy core ==================
-def compute_state() -> dict:
+def compute_state() -> Dict[str, object]:
     prices_d = fetch_unadjusted_close(TICKERS, start=START)
     sma150_d = rolling_sma_per_column(prices_d, SMA_DAYS)
     sma10_d  = rolling_sma_per_column(prices_d, TENM_SMA_DAYS)
@@ -185,7 +193,8 @@ def compute_state() -> dict:
     latest_rows = []
     for t in TICKERS:
         s = prices_d[t].dropna()
-        if len(s) == 0: continue
+        if len(s) == 0:
+            continue
         d = s.index[-1]
         latest_rows.append({"Ticker": t, "Date": d, "Close": s.iloc[-1], "SMA": sma150_d.loc[d, t]})
     latest = pd.DataFrame(latest_rows).set_index("Ticker")
@@ -223,12 +232,14 @@ def compute_state() -> dict:
         "gate_today": gate_today,
     }
 
-# ---------- Build message ----------
-def build_message(state: dict) -> str:
+# ---------- Build message exactly like 'Ausgabe.txt' ----------
+def build_message(state: Dict[str, object]) -> str:
     as_of = state["as_of"]
-    gm: List[GateRow] = state["gate_month"]   # type: ignore
-    rank = state["ranking_today"]             # type: ignore
-    gt: List[GateRow] = state["gate_today"]   # type: ignore
+    lev_off = state["lev_official"]
+    lev_today = state["lev_today"]
+    gm: List[GateRow] = state["gate_month"]  # type: ignore
+    rank = state["ranking_today"]            # type: ignore
+    gt: List[GateRow] = state["gate_today"]  # type: ignore
 
     parts: List[str] = []
     parts.append(f"Letzter Monat: {as_of}")
@@ -236,47 +247,48 @@ def build_message(state: dict) -> str:
     parts.append("Top 3")
     parts.append(sep_line())
 
-    # Monat: Ticker  Preis  20d-Vol  Gate
+    # Tabelle: Ticker  Preis  20d-Vol  Gate
     headers_m = ["Ticker", "Preis", "20d-Vol", "Gate"]
     rows_m = [[r.ticker, r.price or "", r.vol20, r.gate] for r in gm]
     parts.append(table_schema(headers_m, rows_m))
     parts.append("")
-    parts.append(f"Leverage: {state['lev_official']}")
+    parts.append(f"Leverage: {lev_off}")
     parts.append(sep_line())
     parts.append("")
     parts.append("Stand heute (über SMA150):")
     parts.append(sep_line())
 
-    # Heute-Ranking: Ticker  ΣMom  ΔSMA
+    # Tabelle: Ticker  ΣMom  ΔSMA (alle über SMA150, nach ΣMom sortiert)
     headers_r = ["Ticker", "ΣMom", "ΔSMA"]
-    rows_r = [[r["ticker"], r["sumom"], r["dsma"]] for r in rank]
+    rows_r = [[r["ticker"], r["sumom"], r["dsma"]] for r in rank]  # type: ignore
     parts.append(table_schema(headers_r, rows_r))
     parts.append("")
     parts.append(sep_line())
     parts.append("Top-3")
     parts.append(sep_line())
 
-    # Heute-Gate: Ticker  Date  20d-Vol  Gate
+    # Tabelle heute: Ticker  Date  20d-Vol  Gate
     headers_t = ["Ticker", "Date", "20d-Vol", "Gate"]
     rows_t = [[r.ticker, r.date or "", r.vol20, r.gate] for r in gt]
     parts.append(table_schema(headers_t, rows_t))
     parts.append("")
-    parts.append(f"Leverage: {state['lev_today']}")
+    parts.append(f"Leverage: {lev_today}")
 
     return "\n".join(parts).rstrip() + "\n"
 
 # ================== Discord ==================
-def send_plain(content: str, webhook_url: str):
+def send_codeblock(content: str, webhook_url: str):
     if not webhook_url:
         raise ValueError("DISCORD_WEBHOOK_URL ist nicht gesetzt.")
-    r = requests.post(webhook_url, json={"content": content}, timeout=30)
+    payload = {"content": f"```{content}```"}
+    r = requests.post(webhook_url, json=payload, timeout=30)
     r.raise_for_status()
 
 # ================== Main ==================
 def main():
     state = compute_state()
     text = build_message(state)
-    send_plain(text, DISCORD_WEBHOOK_URL)
+    send_codeblock(text, DISCORD_WEBHOOK_URL)
 
 if __name__ == "__main__":
     main()
