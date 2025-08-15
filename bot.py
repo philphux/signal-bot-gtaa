@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Signal Bot v3.0
-- Erstellt eine gut lesbare Plain-Discord-Nachricht (kein Codeblock, keine Rahmen).
-- Optional (DEBUG=1): schickt zusätzlich die Pretty-View-Tabellen als zweiten Post (Monospace).
-- Strategie/Logik wie zuvor (ULT-GTAA v2.5).
+Discord Signal Bot v3.1 (Tabellenansicht, monospace Codeblock)
+- Sendet einen einzigen Post mit hübsch ausgerichteten ASCII-Tabellen.
+- DEBUG=1: Gate-Tabellen zusätzlich mit 10M-SMA, obs20, Reason.
+- Strategie/Logik: ULT-GTAA (unadjusted close, SMA150-Filter, ΣMomentum 1/3/6/9M ohne Überlappung,
+  Leverage-Gate nur Top-3: Preis > 10M-SMA & 20d-Vol < 30%).
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ VOL_WINDOW     = 20
 VOL_THR        = 0.30
 TOP_N          = 3
 
-DEBUG          = os.getenv("DEBUG", "0") == "1"  # bei 1: zusätzlich Pretty-View posten
+DEBUG          = os.getenv("DEBUG", "0") == "1"
 ANNUALIZER_MODE = "uniform_252"
 MIXED_ANNUALIZER: Dict[str, int] = {"BTC-USD": 365}  # nur bei "mixed" aktiv
 
@@ -84,42 +85,23 @@ def realized_vol_ann_from_prices_per_column(
         out[col] = (r.rolling(window, min_periods=window).std() * np.sqrt(ann)).reindex(prices.index)
     return pd.DataFrame(out, index=prices.index)
 
+# ---- Momentum ohne Überlappung (1/3/6/9M kumuliert) ----
 def sum_momentum_1_3_6_9m(rets_m: pd.DataFrame, as_of_eom: pd.Timestamp) -> pd.Series:
-    """
-    KORREKT: ΣMomentum = Summe der *vier kumulierten* Renditen über 1/3/6/9 Monate,
-    jeweils als (Preis_asof / Preis_vor_m_Monaten - 1). Keine Überlappungs-Doppelzählung.
-
-    Hinweis: Wir arbeiten auf 'rets_m' Index (EOM). Für die Preisbasis nehmen wir
-    die zugehörigen EOM-Preise, die aus 'rets_m' rekonstruierbar sind: P_t = P_{t-1} * (1 + r_t).
-    Praktisch ist es robuster, wenn wir die Monats-Preise direkt übergeben; deshalb
-    rekonstruiere ich hier aus rets_m die Preisreihe relativ (Start=1.0).
-    """
-    # Reconstruiere relative Preisreihe (Start = 1.0)
-    # P_t = cumprod(1 + r_t)
+    # Rekonstruiere relative Preise (Start=1.0) aus Monatsreturns
     prices_rel = (1.0 + rets_m).cumprod()
-
-    # Stelle sicher, dass 'as_of_eom' im Index vorhanden ist.
     if as_of_eom not in prices_rel.index:
         as_of_eom = prices_rel.index.max()
-
     pos = prices_rel.index.get_loc(as_of_eom)
 
-    def cumret_over_months(series: pd.Series, m: int) -> float:
-        if pos - m < 0:
-            return np.nan
-        p_now = series.iloc[pos]
-        p_then = series.iloc[pos - m]
-        return (p_now / p_then) - 1.0
+    def cumret(series: pd.Series, m: int) -> float:
+        if pos - m < 0: return np.nan
+        return series.iloc[pos] / series.iloc[pos - m] - 1.0
 
     out = {}
     for col in prices_rel.columns:
         s = prices_rel[col].dropna()
-        # falls Daten zu kurz sind, wird np.nan verwendet
-        r1  = cumret_over_months(s, 1)
-        r3  = cumret_over_months(s, 3)
-        r6  = cumret_over_months(s, 6)
-        r9  = cumret_over_months(s, 9)
-        out[col] = np.nansum([r1, r3, r6, r9])
+        parts = [cumret(s, 1), cumret(s, 3), cumret(s, 6), cumret(s, 9)]
+        out[col] = np.nansum(parts)
     return pd.Series(out).sort_values(ascending=False)
 
 def compute_obs20(prices: pd.Series, d: pd.Timestamp, window: int = VOL_WINDOW) -> int:
@@ -131,10 +113,8 @@ def evaluate_gate(price: float, v20: float, s10m: float) -> Tuple[bool, str]:
     if any(pd.isna(x) for x in (price, v20, s10m)):
         return False, "NaN input"
     reasons = []
-    if not (price > s10m):
-        reasons.append("Preis<=10M-SMA")
-    if not (v20 < VOL_THR):
-        reasons.append(f"Vol>={VOL_THR:.0%}")
+    if not (price > s10m): reasons.append("Preis<=10M-SMA")
+    if not (v20 < VOL_THR): reasons.append(f"Vol>={VOL_THR:.0%}")
     ok = (len(reasons) == 0)
     return ok, ("OK" if ok else ";".join(reasons))
 
@@ -149,24 +129,27 @@ def fmt_pct(v) -> str:
     return "NaN" if pd.isna(v) else f"{v*100:.2f}%"
 
 def make_pretty_table(headers: List[str], rows: List[List[str]], min_widths: Dict[int, int] | None = None) -> str:
+    """
+    Links­bündige ASCII-Tabelle (Spaces). Spaltenbreite = max(Header, Zellen, Mindestbreite).
+    """
     min_widths = min_widths or {}
     cols = len(headers)
     widths = [len(str(headers[i])) for i in range(cols)]
     for r in rows:
         for i, cell in enumerate(r):
             widths[i] = max(widths[i], len(str(cell)))
-    for i, wmin in min_widths.items():
-        if i < cols:
-            widths[i] = max(widths[i], wmin)
+    for i, wmin in (min_widths or {}).items():
+        if i < cols: widths[i] = max(widths[i], wmin)
     head = "  ".join(str(headers[i]).ljust(widths[i]) for i in range(cols))
     sep  = "  ".join("-" * widths[i] for i in range(cols))
     body = "\n".join("  ".join(str(r[i]).ljust(widths[i]) for i in range(cols)) for r in rows)
     return "\n".join([head, sep, body]) if rows else "\n".join([head, sep])
 
-# ================== Dataclasses für Plain-Formatierung ==================
+# ================== Dataclasses ==================
 @dataclass
 class GateRow:
     ticker: str
+    date: Optional[str]  # nur „heute“-Gate befüllt
     price: str
     vol20: str
     gate: str
@@ -174,7 +157,7 @@ class GateRow:
     obs20: Optional[str] = None
     reason: Optional[str] = None
 
-# ================== Strategy core (liefert strukturierte Daten + Strings) ==================
+# ================== Strategy core ==================
 def compute_state() -> Dict[str, object]:
     prices_d = fetch_unadjusted_close(TICKERS, start=START)
     sma150_d = rolling_sma_per_column(prices_d, SMA_DAYS)
@@ -203,8 +186,8 @@ def compute_state() -> Dict[str, object]:
             checks.append(ok)
             d_m = prices_d.index[prices_d.index <= as_of].max()
             obs20 = compute_obs20(prices_d[t], d_m, VOL_WINDOW)
-            gate_month.append(GateRow(short_ticker(t), fmt_price(p), fmt_pct(v20), "PASS" if ok else "FAIL",
-                                      fmt_price(s10), str(obs20), reason))
+            gate_month.append(GateRow(short_ticker(t), None, fmt_price(p), fmt_pct(v20),
+                                      "PASS" if ok else "FAIL", fmt_price(s10), str(obs20), reason))
         allow_leverage_official = all(checks)
     else:
         allow_leverage_official = False
@@ -214,8 +197,7 @@ def compute_state() -> Dict[str, object]:
     latest_rows = []
     for t in TICKERS:
         s = prices_d[t].dropna()
-        if len(s) == 0:
-            continue
+        if len(s) == 0: continue
         d = s.index[-1]
         latest_rows.append({"Ticker": t, "Date": d, "Close": s.iloc[-1], "SMA": sma150_d.loc[d, t]})
     latest = pd.DataFrame(latest_rows).set_index("Ticker")
@@ -238,8 +220,8 @@ def compute_state() -> Dict[str, object]:
             ok, reason = evaluate_gate(p, v20, s10)
             checks.append(ok)
             obs20 = compute_obs20(prices_d[t], d, VOL_WINDOW)
-            gate_today.append(GateRow(short_ticker(t), fmt_price(p), fmt_pct(v20), "PASS" if ok else "FAIL",
-                                      fmt_price(s10), str(obs20), reason))
+            gate_today.append(GateRow(short_ticker(t), str(pd.to_datetime(d).date()), fmt_price(p), fmt_pct(v20),
+                                      "PASS" if ok else "FAIL", fmt_price(s10), str(obs20), reason))
         allow_leverage_today = all(checks)
     else:
         allow_leverage_today = False
@@ -255,60 +237,8 @@ def compute_state() -> Dict[str, object]:
         "gate_today": gate_today,
     }
 
-# ---------- Pretty View (nur für Debug-Post) ----------
-def build_pretty_view(state: Dict[str, object], debug: bool) -> str:
-    out = []
-    out.append("=== Letzter abgeschlossener Monat ===")
-    out.append(f"As-of: {state['as_of']}\n")
-    out.append("Top-3:")
-    top = state["top_official"]
-    if top:
-        rows_top = [[t, f"{100.0/len(top):.1f}%"] for t in top]  # equal weight
-        out.append(make_pretty_table(["Ticker","Gewicht"], rows_top, {0:5, 1:7}))
-    else:
-        out.append("—")
-    out.append("")
-    out.append(f"Leverage-Empfehlung: {state['lev_official']}\n")
-
-    # Monats-Gate
-    gm: List[GateRow] = state["gate_month"]  # type: ignore
-    if debug:
-        headers = ["Ticker","Preis","20d-Vol","Gate","10M-SMA","obs20","Reason"]
-        rows = [[r.ticker,r.price,r.vol20,r.gate,r.sma10m,r.obs20,r.reason] for r in gm]
-    else:
-        headers = ["Ticker","Preis","20d-Vol","Gate"]
-        rows = [[r.ticker,r.price,r.vol20,r.gate] for r in gm]
-    out.append(make_pretty_table(headers, rows, {0:5,1:10,2:7,3:4}))
-    if rows:
-        passed = sum(1 for r in rows if r[3] == "PASS")
-        out.append(f"\nGate-Summary: {passed}/{len(rows)} PASS")
-    out.append("\n")
-    # Heute
-    out.append("=== Stand heute ===\n")
-    rank = state["ranking_today"]  # type: ignore
-    if not rank:
-        out.append("Über SMA150: —\n")
-    else:
-        rows_rank = [[r["ticker"], r["sumom"], r["dsma"]] for r in rank]
-        out.append(make_pretty_table(["Ticker","ΣMom","ΔSMA"], rows_rank, {0:5,1:7,2:7}))
-        out.append("")
-    out.append(f"Leverage-Empfehlung: {state['lev_today']}\n")
-    gt: List[GateRow] = state["gate_today"]  # type: ignore
-    if debug:
-        headers = ["Ticker","Date","Preis","20d-Vol","Gate","10M-SMA","obs20","Reason"]
-        rows = [[r.ticker,"",r.price,r.vol20,r.gate,r.sma10m,r.obs20,r.reason] for r in gt]
-    else:
-        headers = ["Ticker","Date","Preis","20d-Vol","Gate"]
-        rows = [[r.ticker,"",r.price,r.vol20,r.gate] for r in gt]
-    # Date ist im Pretty-View oben nicht nötig, könnte ergänzt werden, falls gewünscht.
-    out.append(make_pretty_table(headers, rows, {0:5,1:10,2:10,3:7,4:4}))
-    if rows:
-        passed = sum(1 for r in rows if r[4] == "PASS")
-        out.append(f"\nGate-Summary: {passed}/{len(rows)} PASS")
-    return "\n".join(out).rstrip() + "\n"
-
-# ---------- Plain Discord Nachricht (ohne Codeblock) ----------
-def build_discord_plain(state: Dict[str, object]) -> str:
+# ---------- Pretty tables to text ----------
+def build_pretty_tables(state: Dict[str, object]) -> str:
     as_of = state["as_of"]
     top = state["top_official"]
     lev_off = state["lev_official"]
@@ -317,70 +247,72 @@ def build_discord_plain(state: Dict[str, object]) -> str:
     gm: List[GateRow] = state["gate_month"]  # type: ignore
     gt: List[GateRow] = state["gate_today"]  # type: ignore
 
-    lines: List[str] = []
-    lines.append("**GAA Signals**")
-    lines.append(f"*As-of EOM:* {as_of}")
-    lines.append("")
+    blocks: List[str] = []
+
+    blocks.append("GAA Signals")
+    blocks.append(f"As-of EOM: {as_of}")
+    blocks.append("")
+
+    # Top-3 Tabelle
     if top:
-        lines.append("**Top-3 (equal weight):** " + ", ".join(f"**{t}**" for t in top))
+        rows_top = [[t, f"{100.0/len(top):.1f}%"] for t in top]
+        blocks.append(make_pretty_table(["Ticker","Gewicht"], rows_top, {0:5,1:7}))
     else:
-        lines.append("**Top-3 (equal weight):** —")
-    lines.append(f"**Leverage (EOM):** {lev_off}")
-    lines.append("")
-    # Monats-Gate kompakt
-    if gm:
-        lines.append("**Gate (EOM, Top-3):** Preis>SMA10M & 20d-Vol<30%")
-        for r in gm:
-            parts = [f"{r.ticker}", f"Preis {r.price}", f"Vol {r.vol20}", f"{'✅' if r.gate=='PASS' else '❌'}"]
-            if DEBUG and r.sma10m:  # bei lokalem Debug ggf. mitlaufen lassen
-                parts += [f"10M {r.sma10m}", f"obs20 {r.obs20}"]
-            lines.append(" • " + "  |  ".join(parts))
-        lines.append("")
+        blocks.append("Top-3: —")
+    blocks.append(f"\nLeverage (EOM): {lev_off}\n")
 
-    # Heute Ranking
-    lines.append("**Heute: über SMA150 (nach ΣMomentum):**")
+    # Monats-Gate Tabelle
+    if DEBUG:
+        headers_m = ["Ticker","Preis","20d-Vol","Gate","10M-SMA","obs20","Reason"]
+        rows_m = [[r.ticker,r.price,r.vol20,r.gate,r.sma10m,r.obs20,r.reason] for r in gm]
+    else:
+        headers_m = ["Ticker","Preis","20d-Vol","Gate"]
+        rows_m = [[r.ticker,r.price,r.vol20,r.gate] for r in gm]
+    blocks.append("Gate (EOM, Top-3): Preis>SMA10M & 20d-Vol<30%")
+    blocks.append(make_pretty_table(headers_m, rows_m, {0:5,1:10,2:7,3:4}))
+    if rows_m:
+        passed = sum(1 for r in rows_m if r[3] == "PASS")
+        blocks.append(f"\nGate-Summary: {passed}/{len(rows_m)} PASS")
+    blocks.append("")
+
+    # Ranking heute Tabelle
+    blocks.append("Heute: über SMA150 (nach ΣMomentum):")
     if rank:
-        for r in rank:
-            lines.append(f"• **{r['ticker']}** — ΣMom {r['sumom']}  |  ΔSMA {r['dsma']}")
+        rows_rank = [[r["ticker"], r["sumom"], r["dsma"]] for r in rank]  # type: ignore
+        blocks.append(make_pretty_table(["Ticker","ΣMom","ΔSMA"], rows_rank, {0:5,1:7,2:7}))
     else:
-        lines.append("• —")
-    lines.append(f"**Leverage (heute):** {lev_today}")
-    lines.append("")
+        blocks.append("—")
+    blocks.append(f"\nLeverage (heute): {lev_today}\n")
 
-    # Heute Gate kompakt (Top-3)
-    if gt:
-        lines.append("**Gate (heute, Top-3):** Preis>SMA10M & 20d-Vol<30%")
-        for r in gt:
-            lines.append(f"• **{r.ticker}** — Preis {r.price}  |  Vol {r.vol20}  |  {'✅ PASS' if r.gate=='PASS' else '❌ FAIL'}")
-    return "\n".join(lines).strip()
+    # Heute-Gate Tabelle
+    if DEBUG:
+        headers_t = ["Ticker","Date","Preis","20d-Vol","Gate","10M-SMA","obs20","Reason"]
+        rows_t = [[r.ticker,r.date,r.price,r.vol20,r.gate,r.sma10m,r.obs20,r.reason] for r in gt]
+    else:
+        headers_t = ["Ticker","Date","Preis","20d-Vol","Gate"]
+        rows_t = [[r.ticker,r.date,r.price,r.vol20,r.gate] for r in gt]
+    blocks.append("Gate (heute, Top-3): Preis>SMA10M & 20d-Vol<30%")
+    blocks.append(make_pretty_table(headers_t, rows_t, {0:5,1:10,2:10,3:7,4:4}))
+    if rows_t:
+        passed = sum(1 for r in rows_t if r[4] == "PASS")
+        blocks.append(f"\nGate-Summary: {passed}/{len(rows_t)} PASS")
+
+    return "\n".join(blocks).rstrip() + "\n"
 
 # ================== Discord ==================
-def send_message(content: str, webhook_url: str):
-    if not webhook_url:
-        raise ValueError("DISCORD_WEBHOOK_URL ist nicht gesetzt.")
-    r = requests.post(webhook_url, json={"content": content}, timeout=30)
-    r.raise_for_status()
-
-def send_codeblock(content: str, webhook_url: str, pause_sec: float = 0.5):
-    """Optionaler Pretty-View-Post als Codeblock (Monospace)."""
+def send_codeblock(content: str, webhook_url: str):
+    """Sendet den gesamten Report als einzelner Codeblock (monospace, saubere Spalten)."""
     if not webhook_url:
         raise ValueError("DISCORD_WEBHOOK_URL ist nicht gesetzt.")
     payload = {"content": f"```{content}```"}
     r = requests.post(webhook_url, json=payload, timeout=30)
     r.raise_for_status()
-    time.sleep(pause_sec)
 
 # ================== Main ==================
 def main():
     state = compute_state()
-    # 1) Plain, ohne Rahmen
-    plain = build_discord_plain(state)
-    send_message(plain, DISCORD_WEBHOOK_URL)
-    # 2) Optional: zusätzlich Pretty-View (DEBUG)
-    if DEBUG:
-        pretty = build_pretty_view(state, debug=True)
-        send_codeblock(pretty, DISCORD_WEBHOOK_URL)
+    text = build_pretty_tables(state)
+    send_codeblock(text, DISCORD_WEBHOOK_URL)
 
 if __name__ == "__main__":
     main()
-
