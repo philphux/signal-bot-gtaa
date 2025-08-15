@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Signal Bot v3.1 (Tabellenansicht, monospace Codeblock)
-- Sendet einen einzigen Post mit hübsch ausgerichteten ASCII-Tabellen.
-- DEBUG=1: Gate-Tabellen zusätzlich mit 10M-SMA, obs20, Reason.
-- Strategie/Logik: ULT-GTAA (unadjusted close, SMA150-Filter, ΣMomentum 1/3/6/9M ohne Überlappung,
-  Leverage-Gate nur Top-3: Preis > 10M-SMA & 20d-Vol < 30%).
+Discord Signal Bot v3.2 – Ausgabe im Schema aus 'Ausgabe.txt'
+- Feste ASCII-Tabellen & Trenner, exakt wie im Muster.
+- ΣMomentum 1/3/6/9M ohne Überlappung.
+- Leverage-Gate nur Top-3 (EOM & Heute): Preis > 10M-SMA & 20d-Vol < 30%.
 """
 
 from __future__ import annotations
 
 import os
-import time
+import requests
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-import requests
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -28,9 +27,9 @@ VOL_WINDOW     = 20
 VOL_THR        = 0.30
 TOP_N          = 3
 
-DEBUG          = os.getenv("DEBUG", "0") == "1"
+DEBUG          = os.getenv("DEBUG", "0") == "1"        # Layout bleibt gleich
 ANNUALIZER_MODE = "uniform_252"
-MIXED_ANNUALIZER: Dict[str, int] = {"BTC-USD": 365}  # nur bei "mixed" aktiv
+MIXED_ANNUALIZER: Dict[str, int] = {"BTC-USD": 365}    # nur bei "mixed" aktiv
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -76,19 +75,13 @@ def realized_vol_ann_from_prices_per_column(
     for col in prices.columns:
         s = prices[col].dropna().astype(float)
         r = s.pct_change(fill_method=None)
-        if annualizer_mode == "uniform_252":
-            ann = 252
-        elif annualizer_mode == "uniform_365":
-            ann = 365
-        else:
-            ann = mixed_map.get(col, 252)
+        ann = 252 if annualizer_mode == "uniform_252" else 365 if annualizer_mode == "uniform_365" else mixed_map.get(col, 252)
         out[col] = (r.rolling(window, min_periods=window).std() * np.sqrt(ann)).reindex(prices.index)
     return pd.DataFrame(out, index=prices.index)
 
 # ---- Momentum ohne Überlappung (1/3/6/9M kumuliert) ----
 def sum_momentum_1_3_6_9m(rets_m: pd.DataFrame, as_of_eom: pd.Timestamp) -> pd.Series:
-    # Rekonstruiere relative Preise (Start=1.0) aus Monatsreturns
-    prices_rel = (1.0 + rets_m).cumprod()
+    prices_rel = (1.0 + rets_m).cumprod()   # Start=1
     if as_of_eom not in prices_rel.index:
         as_of_eom = prices_rel.index.max()
     pos = prices_rel.index.get_loc(as_of_eom)
@@ -100,8 +93,7 @@ def sum_momentum_1_3_6_9m(rets_m: pd.DataFrame, as_of_eom: pd.Timestamp) -> pd.S
     out = {}
     for col in prices_rel.columns:
         s = prices_rel[col].dropna()
-        parts = [cumret(s, 1), cumret(s, 3), cumret(s, 6), cumret(s, 9)]
-        out[col] = np.nansum(parts)
+        out[col] = np.nansum([cumret(s, 1), cumret(s, 3), cumret(s, 6), cumret(s, 9)])
     return pd.Series(out).sort_values(ascending=False)
 
 def compute_obs20(prices: pd.Series, d: pd.Timestamp, window: int = VOL_WINDOW) -> int:
@@ -112,11 +104,8 @@ def compute_obs20(prices: pd.Series, d: pd.Timestamp, window: int = VOL_WINDOW) 
 def evaluate_gate(price: float, v20: float, s10m: float) -> Tuple[bool, str]:
     if any(pd.isna(x) for x in (price, v20, s10m)):
         return False, "NaN input"
-    reasons = []
-    if not (price > s10m): reasons.append("Preis<=10M-SMA")
-    if not (v20 < VOL_THR): reasons.append(f"Vol>={VOL_THR:.0%}")
-    ok = (len(reasons) == 0)
-    return ok, ("OK" if ok else ";".join(reasons))
+    ok = (price > s10m) and (v20 < VOL_THR)
+    return ok, "OK" if ok else "FAIL"
 
 # ================== Formatting helpers ==================
 def short_ticker(t: str) -> str:
@@ -128,34 +117,40 @@ def fmt_price(v) -> str:
 def fmt_pct(v) -> str:
     return "NaN" if pd.isna(v) else f"{v*100:.2f}%"
 
-def make_pretty_table(headers: List[str], rows: List[List[str]], min_widths: Dict[int, int] | None = None) -> str:
+def fmt_pct_str(v) -> str:
+    # falls bereits Prozentstring (heute-Ranking), einfach zurückgeben
+    return v if isinstance(v, str) else fmt_pct(v)
+
+def table_schema(headers: List[str], rows: List[List[str]]) -> str:
     """
-    Links­bündige ASCII-Tabelle (Spaces). Spaltenbreite = max(Header, Zellen, Mindestbreite).
+    Rendert Tabelle nach dem Muster:
+    Header-Zeile
+    ------  ----------  -------  ----   (Striche = Länge jedes Header-Labels)
+    Datenzeilen (links, mit 2 Spaces zwischen Spalten)
     """
-    min_widths = min_widths or {}
-    cols = len(headers)
-    widths = [len(str(headers[i])) for i in range(cols)]
+    # Spaltenbreiten für Ausrichtung bestimmen
+    widths = [len(h) for h in headers]
     for r in rows:
         for i, cell in enumerate(r):
             widths[i] = max(widths[i], len(str(cell)))
-    for i, wmin in (min_widths or {}).items():
-        if i < cols: widths[i] = max(widths[i], wmin)
-    head = "  ".join(str(headers[i]).ljust(widths[i]) for i in range(cols))
-    sep  = "  ".join("-" * widths[i] for i in range(cols))
-    body = "\n".join("  ".join(str(r[i]).ljust(widths[i]) for i in range(cols)) for r in rows)
-    return "\n".join([head, sep, body]) if rows else "\n".join([head, sep])
+    # Header
+    head_line = "  ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
+    underline = "  ".join("-" * len(headers[i]) for i in range(len(headers)))  # genau Header-Länge
+    # Rows
+    body = "\n".join("  ".join(str(r[i]).ljust(widths[i]) for i in range(len(headers))) for r in rows)
+    return "\n".join([head_line, underline, body]) if rows else "\n".join([head_line, underline])
+
+def sep_line() -> str:
+    return "-" * 33
 
 # ================== Dataclasses ==================
 @dataclass
 class GateRow:
     ticker: str
-    date: Optional[str]  # nur „heute“-Gate befüllt
-    price: str
+    date: Optional[str]  # nur für "heute"-Gate
+    price: Optional[str]
     vol20: str
     gate: str
-    sma10m: Optional[str] = None
-    obs20: Optional[str] = None
-    reason: Optional[str] = None
 
 # ================== Strategy core ==================
 def compute_state() -> Dict[str, object]:
@@ -173,7 +168,7 @@ def compute_state() -> Dict[str, object]:
     as_of = last_completed_month_label()
     sum_mom = sum_momentum_1_3_6_9m(rets_m, as_of)
 
-    # Monatsblock
+    # Monatsblock (Top-3 über SMA150)
     mask = prices_m.loc[as_of] > sma150_m.loc[as_of]
     top_official = [t for t in sum_mom.index if bool(mask.get(t, False))][:TOP_N]
 
@@ -182,12 +177,9 @@ def compute_state() -> Dict[str, object]:
         checks = []
         for t in top_official:
             p, s10, v20 = prices_m.loc[as_of, t], sma10_m.loc[as_of, t], vol20_m.loc[as_of, t]
-            ok, reason = evaluate_gate(p, v20, s10)
+            ok, _ = evaluate_gate(p, v20, s10)
             checks.append(ok)
-            d_m = prices_d.index[prices_d.index <= as_of].max()
-            obs20 = compute_obs20(prices_d[t], d_m, VOL_WINDOW)
-            gate_month.append(GateRow(short_ticker(t), None, fmt_price(p), fmt_pct(v20),
-                                      "PASS" if ok else "FAIL", fmt_price(s10), str(obs20), reason))
+            gate_month.append(GateRow(short_ticker(t), None, fmt_price(p), fmt_pct(v20), "PASS" if ok else "FAIL"))
         allow_leverage_official = all(checks)
     else:
         allow_leverage_official = False
@@ -217,11 +209,9 @@ def compute_state() -> Dict[str, object]:
         for t in ranked_today[:TOP_N]:
             d = latest.loc[t, "Date"]
             p, s10, v20 = prices_d.loc[d, t], sma10_d.loc[d, t], vol20_d.loc[d, t]
-            ok, reason = evaluate_gate(p, v20, s10)
+            ok, _ = evaluate_gate(p, v20, s10)
             checks.append(ok)
-            obs20 = compute_obs20(prices_d[t], d, VOL_WINDOW)
-            gate_today.append(GateRow(short_ticker(t), str(pd.to_datetime(d).date()), fmt_price(p), fmt_pct(v20),
-                                      "PASS" if ok else "FAIL", fmt_price(s10), str(obs20), reason))
+            gate_today.append(GateRow(short_ticker(t), str(pd.to_datetime(d).date()), None, fmt_pct(v20), "PASS" if ok else "FAIL"))
         allow_leverage_today = all(checks)
     else:
         allow_leverage_today = False
@@ -237,8 +227,8 @@ def compute_state() -> Dict[str, object]:
         "gate_today": gate_today,
     }
 
-# ---------- Pretty tables to text ----------
-def build_pretty_tables(state: Dict[str, object]) -> str:
+# ---------- Build message exactly like 'Ausgabe.txt' ----------
+def build_message(state: Dict[str, object]) -> str:
     as_of = state["as_of"]
     top = state["top_official"]
     lev_off = state["lev_official"]
@@ -247,61 +237,43 @@ def build_pretty_tables(state: Dict[str, object]) -> str:
     gm: List[GateRow] = state["gate_month"]  # type: ignore
     gt: List[GateRow] = state["gate_today"]  # type: ignore
 
-    blocks: List[str] = []
+    parts: List[str] = []
+    parts.append(f"Letzter Monat: {as_of}")
+    parts.append(sep_line())
+    parts.append("Top 3")
+    parts.append(sep_line())
 
-    blocks.append("GAA Signals")
-    blocks.append(f"As-of EOM: {as_of}")
-    blocks.append("")
+    # Tabelle: Ticker  Preis  20d-Vol  Gate
+    headers_m = ["Ticker", "Preis", "20d-Vol", "Gate"]
+    rows_m = [[r.ticker, r.price or "", r.vol20, r.gate] for r in gm]
+    parts.append(table_schema(headers_m, rows_m))
+    parts.append("")
+    parts.append(f"Leverage: {lev_off}")
+    parts.append(sep_line())
+    parts.append("")
+    parts.append("Stand heute (über SMA150):")
+    parts.append(sep_line())
 
-    # Top-3 Tabelle
-    if top:
-        rows_top = [[t, f"{100.0/len(top):.1f}%"] for t in top]
-        blocks.append(make_pretty_table(["Ticker","Gewicht"], rows_top, {0:5,1:7}))
-    else:
-        blocks.append("Top-3: —")
-    blocks.append(f"\nLeverage (EOM): {lev_off}\n")
+    # Tabelle: Ticker  ΣMom  ΔSMA (alle über SMA150, nach ΣMom sortiert)
+    headers_r = ["Ticker", "ΣMom", "ΔSMA"]
+    rows_r = [[r["ticker"], r["sumom"], r["dsma"]] for r in rank]  # type: ignore
+    parts.append(table_schema(headers_r, rows_r))
+    parts.append("")
+    parts.append(sep_line())
+    parts.append("Top-3")
+    parts.append(sep_line())
 
-    # Monats-Gate Tabelle
-    if DEBUG:
-        headers_m = ["Ticker","Preis","20d-Vol","Gate","10M-SMA","obs20","Reason"]
-        rows_m = [[r.ticker,r.price,r.vol20,r.gate,r.sma10m,r.obs20,r.reason] for r in gm]
-    else:
-        headers_m = ["Ticker","Preis","20d-Vol","Gate"]
-        rows_m = [[r.ticker,r.price,r.vol20,r.gate] for r in gm]
-    blocks.append("Gate (EOM, Top-3): Preis>SMA10M & 20d-Vol<30%")
-    blocks.append(make_pretty_table(headers_m, rows_m, {0:5,1:10,2:7,3:4}))
-    if rows_m:
-        passed = sum(1 for r in rows_m if r[3] == "PASS")
-        blocks.append(f"\nGate-Summary: {passed}/{len(rows_m)} PASS")
-    blocks.append("")
+    # Tabelle heute: Ticker  Date  20d-Vol  Gate
+    headers_t = ["Ticker", "Date", "20d-Vol", "Gate"]
+    rows_t = [[r.ticker, r.date or "", r.vol20, r.gate] for r in gt]
+    parts.append(table_schema(headers_t, rows_t))
+    parts.append("")
+    parts.append(f"Leverage: {lev_today}")
 
-    # Ranking heute Tabelle
-    blocks.append("Heute: über SMA150 (nach ΣMomentum):")
-    if rank:
-        rows_rank = [[r["ticker"], r["sumom"], r["dsma"]] for r in rank]  # type: ignore
-        blocks.append(make_pretty_table(["Ticker","ΣMom","ΔSMA"], rows_rank, {0:5,1:7,2:7}))
-    else:
-        blocks.append("—")
-    blocks.append(f"\nLeverage (heute): {lev_today}\n")
-
-    # Heute-Gate Tabelle
-    if DEBUG:
-        headers_t = ["Ticker","Date","Preis","20d-Vol","Gate","10M-SMA","obs20","Reason"]
-        rows_t = [[r.ticker,r.date,r.price,r.vol20,r.gate,r.sma10m,r.obs20,r.reason] for r in gt]
-    else:
-        headers_t = ["Ticker","Date","Preis","20d-Vol","Gate"]
-        rows_t = [[r.ticker,r.date,r.price,r.vol20,r.gate] for r in gt]
-    blocks.append("Gate (heute, Top-3): Preis>SMA10M & 20d-Vol<30%")
-    blocks.append(make_pretty_table(headers_t, rows_t, {0:5,1:10,2:10,3:7,4:4}))
-    if rows_t:
-        passed = sum(1 for r in rows_t if r[4] == "PASS")
-        blocks.append(f"\nGate-Summary: {passed}/{len(rows_t)} PASS")
-
-    return "\n".join(blocks).rstrip() + "\n"
+    return "\n".join(parts).rstrip() + "\n"
 
 # ================== Discord ==================
 def send_codeblock(content: str, webhook_url: str):
-    """Sendet den gesamten Report als einzelner Codeblock (monospace, saubere Spalten)."""
     if not webhook_url:
         raise ValueError("DISCORD_WEBHOOK_URL ist nicht gesetzt.")
     payload = {"content": f"```{content}```"}
@@ -311,7 +283,7 @@ def send_codeblock(content: str, webhook_url: str):
 # ================== Main ==================
 def main():
     state = compute_state()
-    text = build_pretty_tables(state)
+    text = build_message(state)
     send_codeblock(text, DISCORD_WEBHOOK_URL)
 
 if __name__ == "__main__":
