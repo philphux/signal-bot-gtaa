@@ -20,7 +20,7 @@ import numpy as np
 import yfinance as yf
 
 # ================== Config ==================
-TICKERS        = ["BTC-USD", "QQQ", "GLD", "USO", "EEM", "FEZ", "IEF"]
+TICKERS        = ["BTC-USD", "QQQ", "GLD", "DBO", "EEM", "FEZ", "IEF"]
 START          = "2024-01-01"
 SMA_DAYS       = 150
 TENM_SMA_DAYS  = 210
@@ -292,3 +292,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
