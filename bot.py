@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Signal Bot v3.2.1 – Ausgabe im Schema aus 'Ausgabe.txt'
-- Codeblock (Monospace) für perfekte Spaltenausrichtung.
-- Unterstreichungen jetzt exakt in Spaltenbreite (nicht nur Header-Länge).
-- ΣMomentum 1/3/6/9M ohne Überlappung.
-- Leverage-Gate nur Top-3 (EOM & Heute): Preis > 10M-SMA & 20d-Vol < 30%.
+Discord Signal Bot v3.2.2 – only post on US trading days
+- Verhindert Postings an Wochenenden & US-Börsenfeiertagen (über QQQ-Check).
+- Override: ALWAYS_SEND=1 erzwingt Versand (z. B. für Tests).
+- Rest: identisch zu v3.2.1 (ΣMomentum, Gates, Formatierung).
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ import os
 import requests
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
+from datetime import datetime, timezone
 
 import pandas as pd
 import numpy as np
@@ -28,11 +28,12 @@ VOL_WINDOW     = 20
 VOL_THR        = 0.30
 TOP_N          = 3
 
-DEBUG          = os.getenv("DEBUG", "0") == "1"        # Layout bleibt gleich
+DEBUG          = os.getenv("DEBUG", "0") == "1"
 ANNUALIZER_MODE = "uniform_252"
-MIXED_ANNUALIZER: Dict[str, int] = {"BTC-USD": 365}    # nur bei "mixed" aktiv
+MIXED_ANNUALIZER: Dict[str, int] = {"BTC-USD": 365}
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+ALWAYS_SEND         = os.getenv("ALWAYS_SEND", "0") == "1"  # optionaler Override
 
 # ================== Data helpers ==================
 def _tz_naive(df: pd.DataFrame) -> pd.DataFrame:
@@ -82,7 +83,7 @@ def realized_vol_ann_from_prices_per_column(
 
 # ---- Momentum ohne Überlappung (1/3/6/9M kumuliert) ----
 def sum_momentum_1_3_6_9m(rets_m: pd.DataFrame, as_of_eom: pd.Timestamp) -> pd.Series:
-    prices_rel = (1.0 + rets_m).cumprod()   # Start=1
+    prices_rel = (1.0 + rets_m).cumprod()
     if as_of_eom not in prices_rel.index:
         as_of_eom = prices_rel.index.max()
     pos = prices_rel.index.get_loc(as_of_eom)
@@ -122,22 +123,12 @@ def fmt_pct_str(v) -> str:
     return v if isinstance(v, str) else fmt_pct(v)
 
 def table_schema(headers: List[str], rows: List[List[str]]) -> str:
-    """
-    Rendert Tabelle:
-      Header-Zeile
-      Unterstreichung: exakt in Spaltenbreite
-      Datenzeilen (links, mit 2 Spaces zwischen Spalten)
-    """
-    # Spaltenbreiten anhand Header + Zellen
     widths = [len(h) for h in headers]
     for r in rows:
         for i, cell in enumerate(r):
             widths[i] = max(widths[i], len("" if cell is None else str(cell)))
-    # Header
     head_line = "  ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
-    # Unterstreichungen in Spaltenbreite (FIX gegenüber v3.2)
     underline = "  ".join("-" * widths[i] for i in range(len(headers)))
-    # Rows
     body = "\n".join(
         "  ".join(("" if r[i] is None else str(r[i])).ljust(widths[i]) for i in range(len(headers)))
         for r in rows
@@ -151,10 +142,28 @@ def sep_line() -> str:
 @dataclass
 class GateRow:
     ticker: str
-    date: Optional[str]  # nur für "heute"-Gate
+    date: Optional[str]
     price: Optional[str]
     vol20: str
     gate: str
+
+# ================== Trading day guard ==================
+def is_us_trading_day() -> bool:
+    """True nur wenn heute ein US-Handelstag ist (Mo–Fr & QQQ hat heutigen Daily-Bar)."""
+    if ALWAYS_SEND:
+        return True
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() >= 5:  # 5=Sa, 6=So
+        return False
+    try:
+        q = yf.download("QQQ", period="7d", interval="1d", auto_adjust=False, progress=False)
+        if q.empty:
+            return False
+        last_bar_date = q.index[-1].tz_convert(None).date()
+        return last_bar_date == now_utc.date()
+    except Exception:
+        # Fail-safe: lieber nichts posten als an Feiertagen zu spammen
+        return False
 
 # ================== Strategy core ==================
 def compute_state() -> Dict[str, object]:
@@ -172,7 +181,7 @@ def compute_state() -> Dict[str, object]:
     as_of = last_completed_month_label()
     sum_mom = sum_momentum_1_3_6_9m(rets_m, as_of)
 
-    # Monatsblock (Top-3 über SMA150)
+    # Monatsblock
     mask = prices_m.loc[as_of] > sma150_m.loc[as_of]
     top_official = [t for t in sum_mom.index if bool(mask.get(t, False))][:TOP_N]
 
@@ -232,7 +241,7 @@ def compute_state() -> Dict[str, object]:
         "gate_today": gate_today,
     }
 
-# ---------- Build message exactly like 'Ausgabe.txt' ----------
+# ---------- Build message ----------
 def build_message(state: Dict[str, object]) -> str:
     as_of = state["as_of"]
     lev_off = state["lev_official"]
@@ -247,7 +256,6 @@ def build_message(state: Dict[str, object]) -> str:
     parts.append("Top 3")
     parts.append(sep_line())
 
-    # Tabelle: Ticker  Preis  20d-Vol  Gate
     headers_m = ["Ticker", "Preis", "20d-Vol", "Gate"]
     rows_m = [[r.ticker, r.price or "", r.vol20, r.gate] for r in gm]
     parts.append(table_schema(headers_m, rows_m))
@@ -258,16 +266,14 @@ def build_message(state: Dict[str, object]) -> str:
     parts.append("Stand heute (über SMA150):")
     parts.append(sep_line())
 
-    # Tabelle: Ticker  ΣMom  ΔSMA (alle über SMA150, nach ΣMom sortiert)
     headers_r = ["Ticker", "ΣMom", "ΔSMA"]
-    rows_r = [[r["ticker"], r["sumom"], r["dsma"]] for r in rank]  # type: ignore
+    rows_r = [[r["ticker"], r["sumom"], r["dsma"]] for r in rank]
     parts.append(table_schema(headers_r, rows_r))
     parts.append("")
     parts.append(sep_line())
     parts.append("Top-3")
     parts.append(sep_line())
 
-    # Tabelle heute: Ticker  Date  20d-Vol  Gate
     headers_t = ["Ticker", "Date", "20d-Vol", "Gate"]
     rows_t = [[r.ticker, r.date or "", r.vol20, r.gate] for r in gt]
     parts.append(table_schema(headers_t, rows_t))
@@ -286,10 +292,14 @@ def send_codeblock(content: str, webhook_url: str):
 
 # ================== Main ==================
 def main():
+    # ---- Guard: nur an US-Handelstagen senden ----
+    if not is_us_trading_day():
+        print("Non-trading day in US markets – skipping Discord post.")
+        return
+
     state = compute_state()
     text = build_message(state)
     send_codeblock(text, DISCORD_WEBHOOK_URL)
 
 if __name__ == "__main__":
     main()
-
