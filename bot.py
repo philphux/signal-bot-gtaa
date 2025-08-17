@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Signal Bot v3.2.2 – only post on US trading days
-- Verhindert Postings an Wochenenden & US-Börsenfeiertagen (über QQQ-Check).
-- Override: ALWAYS_SEND=1 erzwingt Versand (z. B. für Tests).
-- Rest: identisch zu v3.2.1 (ΣMomentum, Gates, Formatierung).
+Discord Signal Bot v3.3 – Today uses EOM-anchored momentum
+- Postet nur an US-Handelstagen (QQQ-Check).
+- 'Stand heute': ΣMOM = Summe aus (Latest / EOM(1,3,6,9M-Anchor) - 1), sortiert nach ΣMOM.
+- Gate HEUTE auf diese Top-3 (Preis > 10M-SMA & 20d-Vol < 30%).
+- EOM-Block unverändert (ΣMomentum 1/3/6/9M ohne Überlappung).
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ VOL_WINDOW     = 20
 VOL_THR        = 0.30
 TOP_N          = 3
 
-DEBUG          = os.getenv("DEBUG", "0") == "1"
+DEBUG           = os.getenv("DEBUG", "0") == "1"
 ANNUALIZER_MODE = "uniform_252"
 MIXED_ANNUALIZER: Dict[str, int] = {"BTC-USD": 365}
 
@@ -98,11 +99,6 @@ def sum_momentum_1_3_6_9m(rets_m: pd.DataFrame, as_of_eom: pd.Timestamp) -> pd.S
         out[col] = np.nansum([cumret(s, 1), cumret(s, 3), cumret(s, 6), cumret(s, 9)])
     return pd.Series(out).sort_values(ascending=False)
 
-def compute_obs20(prices: pd.Series, d: pd.Timestamp, window: int = VOL_WINDOW) -> int:
-    s = prices.dropna().loc[:d]
-    r = s.pct_change(fill_method=None).dropna()
-    return int(r.iloc[-window:].shape[0])
-
 def evaluate_gate(price: float, v20: float, s10m: float) -> Tuple[bool, str]:
     if any(pd.isna(x) for x in (price, v20, s10m)):
         return False, "NaN input"
@@ -118,9 +114,6 @@ def fmt_price(v) -> str:
 
 def fmt_pct(v) -> str:
     return "NaN" if pd.isna(v) else f"{v*100:.2f}%"
-
-def fmt_pct_str(v) -> str:
-    return v if isinstance(v, str) else fmt_pct(v)
 
 def table_schema(headers: List[str], rows: List[List[str]]) -> str:
     widths = [len(h) for h in headers]
@@ -165,6 +158,21 @@ def is_us_trading_day() -> bool:
         # Fail-safe: lieber nichts posten als an Feiertagen zu spammen
         return False
 
+# ================== Helpers for "Today" EOM-anchored momentum ==================
+def eom_anchor_dates_for_today(as_of_eom: pd.Timestamp) -> Dict[int, pd.Timestamp]:
+    """
+    EOM-Anker relativ zum letzten abgeschlossenen Monat (as_of_eom):
+      1M -> as_of_eom
+      3M -> as_of_eom - MonthEnd(2)
+      6M -> as_of_eom - MonthEnd(5)
+      9M -> as_of_eom - MonthEnd(8)
+    """
+    anchors = {1: as_of_eom}
+    anchors[3] = (as_of_eom - pd.offsets.MonthEnd(2)).normalize()
+    anchors[6] = (as_of_eom - pd.offsets.MonthEnd(5)).normalize()
+    anchors[9] = (as_of_eom - pd.offsets.MonthEnd(8)).normalize()
+    return anchors
+
 # ================== Strategy core ==================
 def compute_state() -> Dict[str, object]:
     prices_d = fetch_unadjusted_close(TICKERS, start=START)
@@ -179,9 +187,9 @@ def compute_state() -> Dict[str, object]:
     vol20_m  = realized_vol_ann_from_prices_per_column(prices_d, VOL_WINDOW, ANNUALIZER_MODE, MIXED_ANNUALIZER).ffill().resample("ME").last()
 
     as_of = last_completed_month_label()
-    sum_mom = sum_momentum_1_3_6_9m(rets_m, as_of)
+    sum_mom = sum_momentum_1_3_6_9m(rets_m, as_of)  # EOM-basiert, wie gehabt (für Monatsblock)
 
-    # Monatsblock
+    # ===== Monatsblock =====
     mask = prices_m.loc[as_of] > sma150_m.loc[as_of]
     top_official = [t for t in sum_mom.index if bool(mask.get(t, False))][:TOP_N]
 
@@ -198,7 +206,8 @@ def compute_state() -> Dict[str, object]:
         allow_leverage_official = False
     lev_official = "3x" if allow_leverage_official else "1x"
 
-    # Heute
+    # ===== HEUTE (EOM-anchors) =====
+    # Letzter Handelstag je Ticker + ΔSMA
     latest_rows = []
     for t in TICKERS:
         s = prices_d[t].dropna()
@@ -208,19 +217,42 @@ def compute_state() -> Dict[str, object]:
         latest_rows.append({"Ticker": t, "Date": d, "Close": s.iloc[-1], "SMA": sma150_d.loc[d, t]})
     latest = pd.DataFrame(latest_rows).set_index("Ticker")
     latest["ΔSMA150_%"] = (latest["Close"] / latest["SMA"] - 1.0) * 100.0
-    over_list = latest.index[latest["Close"] > latest["SMA"]].tolist()
-    ranked_today = [t for t in sum_mom.index if t in over_list]
 
+    # Kandidaten: über täglichem SMA150
+    over_list = latest.index[latest["Close"] > latest["SMA"]].tolist()
+
+    # ΣMOM_today: Latest vs EOM-Anker (1/3/6/9M), dann Summe
+    anchors = eom_anchor_dates_for_today(as_of)
+    today_calc = []
+    for t in over_list:
+        if t not in prices_m.columns:
+            continue
+        latest_px = latest.loc[t, "Close"]
+        r_vals = []
+        for n in (1, 3, 6, 9):
+            eom = anchors[n]
+            ref_px = prices_m.loc[eom, t] if (eom in prices_m.index) else np.nan
+            r = (latest_px / ref_px - 1.0) if (pd.notna(latest_px) and pd.notna(ref_px) and ref_px != 0) else np.nan
+            r_vals.append(r)
+        sigma_today = float(np.nansum(r_vals))
+        today_calc.append((t, sigma_today))
+
+    # Sortierung heute NUR nach ΣMOM_today (absteigend)
+    today_calc.sort(key=lambda x: x[1], reverse=True)
+    ranked_today_syms = [t for t, _ in today_calc]
+
+    # Ausgabe-Liste für „Stand heute (über SMA150)“
     today_ranking = [{
         "ticker": short_ticker(t),
-        "sumom": f"{(sum_mom.loc[t]*100.0):.2f}%",
+        "sumom": f"{(sigma*100.0):.2f}%",
         "dsma":  f"{latest.loc[t,'ΔSMA150_%']:.2f}%"
-    } for t in ranked_today]
+    } for t, sigma in today_calc]
 
+    # Gate HEUTE nur auf Top-3 dieser Sortierung
     gate_today: List[GateRow] = []
-    if ranked_today:
+    if ranked_today_syms:
         checks = []
-        for t in ranked_today[:TOP_N]:
+        for t in ranked_today_syms[:TOP_N]:
             d = latest.loc[t, "Date"]
             p, s10, v20 = prices_d.loc[d, t], sma10_d.loc[d, t], vol20_d.loc[d, t]
             ok, _ = evaluate_gate(p, v20, s10)
