@@ -1,33 +1,33 @@
 # GTAA Momentum Discord Bot
 
-Ein Python-Bot, der **Global Tactical Asset Allocation (GTAA)**-Signale in einen Discord-Channel postet.  
-Die Strategie kombiniert Multi-Horizont-Momentum (1M, 3M, 6M, 9M), einen Langfrist-Trendfilter (SMA150) und ein Volatilitäts-Gate — sowohl im **Monatsmodus (EOM)** als auch als **tägliches Update („Today“) auf EOM-Ankern**.
+A Python bot that posts **Global Tactical Asset Allocation (GTAA)** signals into a Discord channel.  
+The strategy combines multi-horizon momentum (1M, 3M, 6M, 9M), a long-term trend filter (SMA150), and a volatility gate — both in **monthly mode (EOM)** and as a **daily update (“Today”) using EOM anchors**.
 
 ---
 
 ## 🚀 Features
 
-- **Monatliche Signale (EOM-basiert):**
-  - Ranking per **ΣMOM** = Summe der 1M/3M/6M/9M-Momenten (nicht überlappend).
-  - **SMA150-Filter** zum Monatsultimo (nur Assets > SMA150 sind zulässig).
-  - Auswahl der **Top-3**.
-  - **Gate (monatlich):** Preis > 10-Monats-SMA und annualisierte 20-Tage-Volatilität < 30 %.
-  - **Leverage:** **3×**, wenn alle drei **PASS**, sonst **1×**.
+- **Monthly signals (EOM-based):**
+  - Ranking via **ΣMOM** = sum of 1M/3M/6M/9M momentum (non-overlapping).
+  - **SMA150 filter** at month-end (only assets above SMA150 are eligible).
+  - Select the **Top 3** assets.
+  - **Gate (monthly):** Price > 10-month SMA and annualized 20-day volatility < 30%.
+  - **Leverage:** **3×** if all three pass, otherwise **1×**.
 
-- **Tägliches Update („Today“):**
-  - Nutzt **EOM-Anker**: letzter Tages-Close vs. letzter EOM für 1M/3M/6M/9M → **ΣMOM_today**.
-  - Berücksichtigt nur Assets **über täglichem SMA150**.
-  - Zeigt Ranking nach **ΣMOM_today** sowie **ΔSMA** (Abstand zum SMA150).
-  - **Gate (heute):** auf die **Top-3** des heutigen Rankings mit täglichem 10M-SMA und 20d-Vol.  
-  - **Leverage:** **3×**, wenn alle drei **PASS**, sonst **1×**.
+- **Daily update (“Today”):**
+  - Uses **EOM anchors**: latest daily close vs. last EOM for 1M/3M/6M/9M → **ΣMOM_today**.
+  - Considers only assets **above daily SMA150**.
+  - Shows ranking by **ΣMOM_today** and **ΔSMA** (distance to SMA150).
+  - **Gate (today):** applied to the **Top 3** of today’s ranking with daily 10M-SMA and 20d-vol.  
+  - **Leverage:** **3×** if all three pass, otherwise **1×**.
 
-- **US-Handelstags-Filter (neu, robust):**
-  - Postet **nur an offiziellen NYSE-Handelstagen** via `exchange-calendars` (Kalender **XNYS**).
-  - **Fallback:** Wenn der Kalender nicht verfügbar ist, wird per **QQQ-Intraday (1m)** geprüft, ob heute (US/Eastern) Marktaktivität vorliegt.
-  - **Override:** `ALWAYS_SEND=1` erzwingt Posts (z. B. für Tests).
+- **US trading day filter (new & robust):**
+  - Posts **only on official NYSE trading days** via `exchange-calendars` (calendar **XNYS**).
+  - **Fallback:** If the calendar is unavailable, checks **QQQ intraday (1m)** to verify activity today (US/Eastern).
+  - **Override:** `ALWAYS_SEND=1` forces posting (e.g. for testing).
 
-- **Discord-Ausgabe:**  
-  - Saubere, monospaced **Code-Blocks** mit fixbreiten Tabellen.
+- **Discord output:**  
+  - Clean, monospaced **code blocks** with fixed-width tables.
 
 ---
 
@@ -44,21 +44,21 @@ pip install -r requirements.txt
 - `numpy`
 - `yfinance`
 - `requests`
-- **neu:** `exchange-calendars>=4.5`
+- **new:** `exchange-calendars>=4.5`
 
-> Hinweis: Die Bot-Datei erwartet **Python ≥ 3.9** (wegen `zoneinfo`).
+> Note: The bot requires **Python ≥ 3.9** (for `zoneinfo`).
 
 ---
 
-## ⚙️ Konfiguration
+## ⚙️ Configuration
 
-Setze folgende Umgebungsvariablen:
+Set the following environment variables:
 
-- `DISCORD_WEBHOOK_URL` – deine Discord Webhook-URL (**erforderlich**).
-- `DEBUG` – `1` für ausführliches Logging (optional).
-- `ALWAYS_SEND` – `1`, um den Handelstags-Check zu überschreiben (optional).
+- `DISCORD_WEBHOOK_URL` – your Discord webhook URL (**required**).
+- `DEBUG` – `1` for verbose logging (optional).
+- `ALWAYS_SEND` – `1` to override the trading-day check (optional).
 
-**Beispiel:**
+**Example:**
 ```bash
 export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 export DEBUG=1
@@ -66,51 +66,51 @@ export DEBUG=1
 
 ---
 
-## ▶️ Nutzung
+## ▶️ Usage
 
-**Manuell starten:**
+**Run manually:**
 ```bash
 python bot.py
 ```
 
-**Cron (lokal/Server):**
+**Cron (local/server):**
 ```bash
 0 12 * * * /usr/bin/python3 /path/to/bot.py
 ```
 
-**GitHub Actions (empfohlen):**  
-Wenn der Bot via Action läuft, wähle eine Uhrzeit **nach US-Börsenschluss** (z. B. ~22:10 UTC ≈ 18:10 ET), damit Tagesdaten stabil sind.  
-Hinterlege Secrets/Vars (Webhook, DEBUG/ALWAYS_SEND) unter **Settings → Secrets and variables**.
+**GitHub Actions (recommended):**  
+If running as a GitHub Action, schedule **after US market close** (e.g. ~22:10 UTC ≈ 18:10 ET), to ensure stable EOD data.  
+Store secrets/vars (Webhook, DEBUG/ALWAYS_SEND) under **Settings → Secrets and variables**.
 
-Minimaler `schedule`-Beispielauszug:
+Minimal `schedule` example:
 ```yaml
 on:
   schedule:
-    - cron: "10 22 * * 1-5"  # 22:10 UTC, Mo–Fr
+    - cron: "10 22 * * 1-5"  # 22:10 UTC, Mon–Fri
 ```
 
 ---
 
-## 📊 Standard-Assets
+## 📊 Default Assets
 
 - **Equities/ETFs:** `QQQ`, `EEM`, `FEZ`  
 - **Commodities:** `GLD`, `DBO`  
 - **Bonds:** `IEF`  
 - **Crypto:** `BTC-USD`
 
-> Passe die Liste bei Bedarf in `bot.py` an (`TICKERS`).
+> Adjust in `bot.py` (`TICKERS`) if needed.
 
 ---
 
-## 📖 Strategie-Details
+## 📖 Strategy Details
 
-- Momentum-Horizonte auf **fixe Perioden** (1M/3M/6M/9M).  
-- Monatslogik und Filter auf **End-of-Month**; Tageslogik nutzt **Latest vs. EOM-Anker**.  
-- Gate-Schwellen: **Preis > 10M-SMA** und **20d-Vol < 30 %**.  
-- **Leverage-Regel:** Top-3 **alle PASS → 3×**, sonst **1×**.
+- Momentum horizons use **fixed periods** (1M/3M/6M/9M).  
+- Monthly logic and filters at **end-of-month**; daily logic uses **latest vs. EOM anchors**.  
+- Gate thresholds: **Price > 10M-SMA** and **20d-vol < 30%**.  
+- **Leverage rule:** Top 3 **all PASS → 3×**, otherwise **1×**.
 
 ---
 
 ## ⚠️ Disclaimer
 
-Dieses Projekt dient **rein zu Bildungszwecken** und stellt **keine Anlageberatung** dar. Nutzung auf eigenes Risiko.
+This project is for **educational purposes only** and does **not constitute investment advice**. Use at your own risk.
