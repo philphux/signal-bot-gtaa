@@ -1,109 +1,116 @@
 # GTAA Momentum Discord Bot
 
-A Python bot that posts **Global Tactical Asset Allocation (GTAA)** momentum signals to a Discord channel.  
-The strategy combines multi-horizon momentum (1M, 3M, 6M, 9M), a long-term trend filter (SMA150), and a volatility-based gate.
+Ein Python-Bot, der **Global Tactical Asset Allocation (GTAA)**-Signale in einen Discord-Channel postet.  
+Die Strategie kombiniert Multi-Horizont-Momentum (1M, 3M, 6M, 9M), einen Langfrist-Trendfilter (SMA150) und ein Volatilitäts-Gate — sowohl im **Monatsmodus (EOM)** als auch als **tägliches Update („Today“) auf EOM-Ankern**.
 
 ---
 
 ## 🚀 Features
 
-- **Monthly signals (EOM-based):**
-  - Rank assets by **ΣMOM** = sum of 1M, 3M, 6M, 9M end-of-month momentum (non-overlapping).
-  - **SMA150 filter** at month end (only assets above SMA150 are eligible).
-  - Select the **Top-3** assets.
-  - **Gate (monthly):** Price > 10-month SMA and 20-day annualized volatility < 30%.
-  - Leverage: **3x** if all three pass, otherwise **1x**.
+- **Monatliche Signale (EOM-basiert):**
+  - Ranking per **ΣMOM** = Summe der 1M/3M/6M/9M-Momenten (nicht überlappend).
+  - **SMA150-Filter** zum Monatsultimo (nur Assets > SMA150 sind zulässig).
+  - Auswahl der **Top-3**.
+  - **Gate (monatlich):** Preis > 10-Monats-SMA und annualisierte 20-Tage-Volatilität < 30 %.
+  - **Leverage:** **3×**, wenn alle drei **PASS**, sonst **1×**.
 
-- **Daily update (“Today”):**
-  - Uses **EOM anchors** for momentum: Latest daily close vs. last EOM for 1M/3M/6M/9M; ΣMOM_today = sum of those four.
-  - Considers only assets **above daily SMA150** (each on its own most recent trading day).
-  - Sorts by **ΣMOM_today** and shows **ΔSMA** (distance to SMA150).
-  - **Gate (today):** applied to the **Top-3** from today’s ranking using daily 10M-SMA and 20d-vol at each asset’s latest date.
-  - Leverage: **3x** if all three pass, otherwise **1x**.
+- **Tägliches Update („Today“):**
+  - Nutzt **EOM-Anker**: letzter Tages-Close vs. letzter EOM für 1M/3M/6M/9M → **ΣMOM_today**.
+  - Berücksichtigt nur Assets **über täglichem SMA150**.
+  - Zeigt Ranking nach **ΣMOM_today** sowie **ΔSMA** (Abstand zum SMA150).
+  - **Gate (heute):** auf die **Top-3** des heutigen Rankings mit täglichem 10M-SMA und 20d-Vol.  
+  - **Leverage:** **3×**, wenn alle drei **PASS**, sonst **1×**.
 
-- **US trading day filter:**
-  - Posts **only on US trading days** (checks QQQ for a daily bar today).
-  - Prevents weekend/holiday posts (BTC trades daily, but equities do not).
+- **US-Handelstags-Filter (neu, robust):**
+  - Postet **nur an offiziellen NYSE-Handelstagen** via `exchange-calendars` (Kalender **XNYS**).
+  - **Fallback:** Wenn der Kalender nicht verfügbar ist, wird per **QQQ-Intraday (1m)** geprüft, ob heute (US/Eastern) Marktaktivität vorliegt.
+  - **Override:** `ALWAYS_SEND=1` erzwingt Posts (z. B. für Tests).
 
-- **Discord output:**
-  - Clean, fixed-width tables posted as code blocks.
+- **Discord-Ausgabe:**  
+  - Saubere, monospaced **Code-Blocks** mit fixbreiten Tabellen.
 
 ---
 
 ## 📦 Installation
 
-Clone the repository and install requirements:
-
-~~~bash
+```bash
 git clone https://github.com/yourusername/gtaa-discord-bot.git
 cd gtaa-discord-bot
 pip install -r requirements.txt
-~~~
+```
 
-**Dependencies**
+### Requirements (`requirements.txt`)
 - `pandas`
 - `numpy`
 - `yfinance`
 - `requests`
+- **neu:** `exchange-calendars>=4.5`
+
+> Hinweis: Die Bot-Datei erwartet **Python ≥ 3.9** (wegen `zoneinfo`).
 
 ---
 
-## ⚙️ Configuration
+## ⚙️ Konfiguration
 
-Set the following environment variables before running:
+Setze folgende Umgebungsvariablen:
 
-- `DISCORD_WEBHOOK_URL` – your Discord webhook URL (**required**).
-- `DEBUG` – set `1` to enable debug logging (optional).
-- `ALWAYS_SEND` – set `1` to force messages even on weekends/holidays (optional).
+- `DISCORD_WEBHOOK_URL` – deine Discord Webhook-URL (**erforderlich**).
+- `DEBUG` – `1` für ausführliches Logging (optional).
+- `ALWAYS_SEND` – `1`, um den Handelstags-Check zu überschreiben (optional).
 
-**Example:**
-
-~~~bash
+**Beispiel:**
+```bash
 export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 export DEBUG=1
-~~~
+```
 
 ---
 
-## ▶️ Usage
+## ▶️ Nutzung
 
-Run manually:
-
-~~~bash
+**Manuell starten:**
+```bash
 python bot.py
-~~~
+```
 
-Or schedule daily execution with `cron`:
-
-~~~bash
+**Cron (lokal/Server):**
+```bash
 0 12 * * * /usr/bin/python3 /path/to/bot.py
-~~~
+```
 
-> On GitHub Actions, set the environment variables as **Repository Secrets/Variables**.
+**GitHub Actions (empfohlen):**  
+Wenn der Bot via Action läuft, wähle eine Uhrzeit **nach US-Börsenschluss** (z. B. ~22:10 UTC ≈ 18:10 ET), damit Tagesdaten stabil sind.  
+Hinterlege Secrets/Vars (Webhook, DEBUG/ALWAYS_SEND) unter **Settings → Secrets and variables**.
+
+Minimaler `schedule`-Beispielauszug:
+```yaml
+on:
+  schedule:
+    - cron: "10 22 * * 1-5"  # 22:10 UTC, Mo–Fr
+```
 
 ---
 
-## 📊 Assets
-
-Default tickers (adjust in `bot.py` if needed):
+## 📊 Standard-Assets
 
 - **Equities/ETFs:** `QQQ`, `EEM`, `FEZ`  
 - **Commodities:** `GLD`, `DBO`  
 - **Bonds:** `IEF`  
 - **Crypto:** `BTC-USD`
 
+> Passe die Liste bei Bedarf in `bot.py` an (`TICKERS`).
+
 ---
 
-## 📖 Strategy Notes
+## 📖 Strategie-Details
 
-- Momentum horizons are measured as price changes over **fixed periods** (1M, 3M, 6M, 9M).  
-- Monthly momentum and filters use **end-of-month** prices; today’s momentum uses **latest vs. EOM anchors**.  
-- Gate thresholds: **Price > 10M-SMA** and **20d-vol < 30%**.  
-- Final leverage is **Top-3 all PASS → 3x**, otherwise **1x**.
+- Momentum-Horizonte auf **fixe Perioden** (1M/3M/6M/9M).  
+- Monatslogik und Filter auf **End-of-Month**; Tageslogik nutzt **Latest vs. EOM-Anker**.  
+- Gate-Schwellen: **Preis > 10M-SMA** und **20d-Vol < 30 %**.  
+- **Leverage-Regel:** Top-3 **alle PASS → 3×**, sonst **1×**.
 
 ---
 
 ## ⚠️ Disclaimer
 
-This project is for **educational purposes only**.  
-It is **not financial advice**. Use at your own risk.
+Dieses Projekt dient **rein zu Bildungszwecken** und stellt **keine Anlageberatung** dar. Nutzung auf eigenes Risiko.
