@@ -2,19 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 Discord Signal Bot v3.3 – Today uses EOM-anchored momentum
-- Postet nur an US-Handelstagen (QQQ-Check).
-- 'Stand heute': ΣMOM = Summe aus (Latest / EOM(1,3,6,9M-Anchor) - 1), sortiert nach ΣMOM.
-- Gate HEUTE auf diese Top-3 (Preis > 10M-SMA & 20d-Vol < 30%).
-- EOM-Block unverändert (ΣMomentum 1/3/6/9M ohne Überlappung).
+Änderungen (Variante A):
+- Postet nur an US-Handelstagen basierend auf offiziellem NYSE-Kalender (exchange-calendars).
+- Fallback: QQQ-1m-Check (yfinance), falls Kalenderpaket nicht verfügbar.
+- ALWAYS_SEND=1 überschreibt den Trading-Day-Check.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import requests
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 import pandas as pd
 import numpy as np
@@ -35,6 +37,15 @@ MIXED_ANNUALIZER: Dict[str, int] = {"BTC-USD": 365}
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 ALWAYS_SEND         = os.getenv("ALWAYS_SEND", "0") == "1"  # optionaler Override
+
+NY_TZ = ZoneInfo("America/New_York")
+
+# ================== Logging ==================
+def _log(msg: str) -> None:
+    """Einheitliches ISO-Logging in UTC (mit 'Z'-Suffix, ohne µs)."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    print(f"{now.isoformat().replace('+00:00','Z')} {msg}")
+    sys.stdout.flush()
 
 # ================== Data helpers ==================
 def _tz_naive(df: pd.DataFrame) -> pd.DataFrame:
@@ -140,23 +151,56 @@ class GateRow:
     vol20: str
     gate: str
 
-# ================== Trading day guard ==================
-def is_us_trading_day() -> bool:
-    """True nur wenn heute ein US-Handelstag ist (Mo–Fr & QQQ hat heutigen Daily-Bar)."""
-    if ALWAYS_SEND:
-        return True
-    now_utc = datetime.now(timezone.utc)
-    if now_utc.weekday() >= 5:  # 5=Sa, 6=So
-        return False
+# ================== Trading day guard (Variante A) ==================
+def _is_session_xnys(ny_date: datetime) -> Optional[bool]:
+    """
+    Prüft den NYSE-Kalender (XNYS) für das gegebene NY-Datum.
+    Gibt True/False zurück oder None bei Fehler/fehlendem Paket.
+    """
     try:
-        q = yf.download("QQQ", period="7d", interval="1d", auto_adjust=False, progress=False)
-        if q.empty:
+        import exchange_calendars as xc  # lazy import
+        cal = xc.get_calendar("XNYS")
+        return cal.is_session(ny_date.date())
+    except Exception as e:
+        if DEBUG:
+            _log(f"[calendar] fallback (reason: {e})")
+        return None
+
+def _is_market_day_via_intraday(now_ny: datetime) -> bool:
+    """
+    Fallback: Prüft per QQQ-1m-Daten, ob HEUTE (NY-Datum) Marktaktivität existiert.
+    Funktioniert auch nach Handelsschluss, solange die letzte Kerze des Tages vorliegt.
+    """
+    try:
+        hist = yf.Ticker("QQQ").history(period="1d", interval="1m", prepost=False)
+        if hist.empty:
+            if DEBUG:
+                _log("[fallback yfinance] empty intraday history for QQQ")
             return False
-        last_bar_date = q.index[-1].tz_convert(None).date()
-        return last_bar_date == now_utc.date()
-    except Exception:
-        # Fail-safe: lieber nichts posten als an Feiertagen zu spammen
+        last_ts = hist.index.tz_convert(NY_TZ)[-1]
+        return last_ts.date() == now_ny.date()
+    except Exception as e:
+        if DEBUG:
+            _log(f"[fallback yfinance] error: {e}")
         return False
+
+def is_us_trading_day() -> bool:
+    """
+    True, wenn HEUTE (NY-Zeit) ein offizieller NYSE-Session-Tag ist.
+    Primär via exchange-calendars; Fallback via QQQ-1m.
+    ALWAYS_SEND=1 überschreibt.
+    """
+    if ALWAYS_SEND:
+        _log("ALWAYS_SEND=1 – overriding trading-day check.")
+        return True
+
+    now_utc = datetime.now(timezone.utc)
+    now_ny  = now_utc.astimezone(NY_TZ)
+
+    cal_ok = _is_session_xnys(now_ny)
+    if cal_ok is None:
+        return _is_market_day_via_intraday(now_ny)
+    return bool(cal_ok)
 
 # ================== Helpers for "Today" EOM-anchored momentum ==================
 def eom_anchor_dates_for_today(as_of_eom: pd.Timestamp) -> Dict[int, pd.Timestamp]:
@@ -324,7 +368,7 @@ def send_codeblock(content: str, webhook_url: str):
 
 # ================== Main ==================
 def main():
-    # ---- Guard: nur an US-Handelstagen senden ----
+    # ---- Guard: nur an US-Handelstagen senden (Kalender + Fallback) ----
     if not is_us_trading_day():
         print("Non-trading day in US markets – skipping Discord post.")
         return
