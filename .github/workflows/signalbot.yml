@@ -4,6 +4,13 @@ on:
   schedule:
     - cron: "15 20 * * *"
   workflow_dispatch:
+   inputs:
+      always_send:
+        description: "Force send even on non-trading days (0/1)"
+        required: true
+        default: "0"
+        type: choice
+        options: ["0", "1"]
 
 jobs:
   run:
