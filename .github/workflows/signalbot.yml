@@ -2,7 +2,7 @@ name: Daily Discord Signal Bot
 
 on:
   schedule:
-    - cron: "15 20 * * *"
+    - cron: "15 21 * * *"
   workflow_dispatch:
    inputs:
       always_send:
