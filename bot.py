@@ -60,10 +60,10 @@ def last_completed_month_label(ts: Optional[pd.Timestamp] = None) -> pd.Timestam
 
 def fetch_unadjusted_close(tickers: List[str], start: str) -> pd.DataFrame:
     if len(tickers) == 1:
-        data = yf.download(tickers[0], start=start, progress=False, auto_adjust=False)
+        data = yf.download(tickers[0], start=start, progress=False, auto_adjust=True)
         close = data["Close"].to_frame(name=tickers[0])
     else:
-        data  = yf.download(tickers, start=start, group_by="ticker", progress=False, auto_adjust=False)
+        data  = yf.download(tickers, start=start, group_by="ticker", progress=False, auto_adjust=True)
         frames = []
         for t in tickers:
             df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
