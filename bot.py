@@ -55,7 +55,7 @@ def _tz_naive(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def last_completed_month_label(ts: Optional[pd.Timestamp] = None) -> pd.Timestamp:
-    ts = (pd.Timestamp.utcnow() if ts is None else pd.Timestamp(ts)).tz_localize(None)
+    ts = (pd.Timestamp.now("UTC") if ts is None else pd.Timestamp(ts)).tz_localize(None)
     return (ts - pd.offsets.MonthEnd(1)).normalize()
 
 def fetch_unadjusted_close(tickers: List[str], start: str) -> pd.DataFrame:
