@@ -59,18 +59,32 @@ def last_completed_month_label(ts: Optional[pd.Timestamp] = None) -> pd.Timestam
     return (ts - pd.offsets.MonthEnd(1)).normalize()
 
 def fetch_unadjusted_close(tickers: List[str], start: str) -> pd.DataFrame:
-    if len(tickers) == 1:
-        data = yf.download(tickers[0], start=start, progress=False, auto_adjust=True)
-        close = data["Close"].to_frame(name=tickers[0])
-    else:
-        data  = yf.download(tickers, start=start, group_by="ticker", progress=False, auto_adjust=True)
-        frames = []
-        for t in tickers:
-            df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
-            frames.append(df["Close"].rename(t))
-        close = pd.concat(frames, axis=1)
-    close = _tz_naive(close.sort_index())
-    return close.reindex(columns=tickers)
+    close_by_ticker = {}
+    pending = list(tickers)
+
+    for attempt in range(2):
+        data = yf.download(
+            pending, start=start, group_by="ticker", progress=False,
+            auto_adjust=True, threads=False,
+        )
+        for ticker in pending:
+            if isinstance(data.columns, pd.MultiIndex):
+                ticker_data = data.get(ticker)
+            else:
+                ticker_data = data if len(pending) == 1 else None
+            close = ticker_data.get("Close") if ticker_data is not None else None
+            if close is not None and close.notna().any():
+                close_by_ticker[ticker] = close
+
+        pending = [ticker for ticker in pending if ticker not in close_by_ticker]
+        if not pending:
+            close = pd.DataFrame(close_by_ticker).reindex(columns=tickers)
+            return _tz_naive(close.sort_index())
+        if attempt == 0:
+            _log(f"Kursabruf wird wiederholt für: {', '.join(pending)}")
+
+    raise RuntimeError(f"Keine Schlusskurse nach erneutem Abruf: {', '.join(pending)}")
+
 
 def monthly_last_ffilled(df: pd.DataFrame) -> pd.DataFrame:
     return df.ffill().resample("ME").last()
