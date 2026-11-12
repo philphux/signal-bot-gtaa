@@ -23,7 +23,7 @@ import numpy as np
 import yfinance as yf
 
 # ================== Config ==================
-TICKERS        = ["BTC-USD", "QQQ", "GLD", "DBO", "EEM", "FEZ", "IEF"]
+TICKERS        = ["QQQ", "GC=F", "CL=F", "^STOXX50E", "EEM", "IEF", "BTC-USD"]
 START          = "2024-01-01"
 SMA_DAYS       = 150
 TENM_SMA_DAYS  = 210
